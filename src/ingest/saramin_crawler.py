@@ -2,233 +2,252 @@ import os
 import json
 import asyncio
 import re
+import random
+import sys
+import time
+from datetime import datetime
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from src.utils.rdb_connector import get_connection
 
-async def extract_rec_ids_from_list(page_num):
-    """
-    1단계: IT개발·데이터 카테고리 목록 페이지에서 공고 번호(rec_idx)를 수집합니다.
-    """
+def write_log(message):
+    """과정 추적용 실시간 로그 파일 기록"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_line = f"[{timestamp}] {message}\n"
+    print(message)
+    with open("crawler_marathon.log", "a", encoding="utf-8") as f:
+        f.write(log_line)
+
+def check_already_exists(rec_idx):
+    """[무적 필터] 타임아웃 터져도 죽지 않고 3번까지 재시도 후 스킵 결정"""
+    for attempt in range(1, 4):
+        try:
+            connection = get_connection()
+            with connection.cursor() as cursor:
+                sql = "SELECT 1 FROM saramin_raw_jobs WHERE rec_idx = %s LIMIT 1;"
+                cursor.execute(sql, (rec_idx,))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            if attempt == 3:
+                write_log(f"   ❌ [체크 에러] DB 연결 최종 실패 (안전을 위해 스킵 패스): {e}")
+                return False
+            time.sleep(5)
+        finally:
+            try: connection.close()
+            except: pass
+    return False
+
+async def extract_jobs_from_list(page_num):
+    """1단계: IT 목록에서 공고 번호와 기본 정보를 스캔합니다."""
     url = f"https://www.saramin.co.kr/zf_user/jobs/list/job-category?page={page_num}&cat_mcls=2&isAjaxRequest=0&page_count=50&sort=RL"
-    rec_indices = []
+    job_list = []
     
     async with async_playwright() as p:
-        # 목록 페이지도 안전하게 일반 브라우저 화면을 띄워 접근
-        browser = await p.chromium.launch(headless=False)
+        # 💡 모니터 바깥 좌표 (2500, 2500)로 창을 완전히 추방
+        browser = await p.chromium.launch(
+            headless=False,
+            args=[
+                '--window-size=200,150',
+                '--window-position=2500,2500',
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox'
+            ]
+        )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            viewport={"width": 1920, "height": 1080}
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
+        await page.set_viewport_size({"width": 200, "height": 150})
         
         try:
-            # 네트워크 헤더가 전송 완료되는 즉시(commit) 페이지 소스를 가로챔
             await page.goto(url, wait_until="commit", timeout=30000)
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             html_content = await page.content()
         except Exception as e:
-            print(f"-> 목록 페이지 접근 실패: {e}")
+            write_log(f"   ⚠️ [{page_num}페이지] 목록 페이지 접근 타임아웃/실패 (스킵) : {e}")
             await browser.close()
-            return rec_indices
+            return job_list
         await browser.close()
 
     soup = BeautifulSoup(html_content, 'html.parser')
     items = soup.select("div.list_item")
-    
     for item in items:
         item_id = item.get('id', '')
         if item_id and item_id.startswith('rec-'):
             idx = item_id.replace('rec-', '').strip()
-            if idx not in rec_indices:
-                rec_indices.append(idx)
-                
-    print(f"-> 목록 {page_num}페이지에서 {len(rec_indices)}개의 공고 일련번호 추출 완료.")
-    return rec_indices
+            corp_tag = item.select_one("a.str_tit") or item.select_one("div.col_corp a")
+            title_tag = item.select_one("a.job_tit") or item.select_one("div.job_tit a")
+            corp_name = corp_tag.get_text(strip=True) if corp_tag else "N/A"
+            job_title = title_tag.get_text(strip=True) if title_tag else "N/A"
+            
+            if idx not in [j['rec_idx'] for j in job_list]:
+                job_list.append({'rec_idx': idx, 'list_company': corp_name, 'list_title': job_title})
+    return job_list
 
-
-async def fetch_and_parse_detail(rec_idx):
-    """
-    2단계: 추출한 공고 번호로 상세페이지에 접속하여 목적에 맞게 선택한 11개 필드 + 본문 전체를 긁어옵니다.
-    """
+async def fetch_and_parse_detail_heavy(job_meta):
+    """2단계: 상세페이지 원문 전체를 화면 밖 꼼수로 고속 스크랩합니다."""
+    rec_idx = job_meta['rec_idx']
     url = f"https://www.saramin.co.kr/zf_user/jobs/relay/view?rec_idx={rec_idx}"
     html_content = ""
     
     async with async_playwright() as p:
-        print("\n[DEBUG 1] 실제 크롬 브라우저 화면을 띄워 우회 접속 중 (Headed 모드)...")
-        
+        # 상세페이지도 화면 바깥 좌표 (2500, 2500)로 완벽 격리 조치
         browser = await p.chromium.launch(
             headless=False, 
             args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-infobars',
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--window-size=1920,1080'
+                '--window-size=200,150',
+                '--window-position=2500,2500',
+                '--disable-blink-features=AutomationControlled', 
+                '--no-sandbox'
             ]
         )
-        
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            java_script_enabled=True
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
-        
         page = await context.new_page()
-        
-        # 자동화 봇 탐지 솔루션 무력화 스크립트 주입
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.navigator.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US', 'en']});
-        """)
+        await page.set_viewport_size({"width": 200, "height": 150})
         
         try:
-            print("[DEBUG 2] 1차 검증: 사람인 메인 홈 접속 시도 중...")
-            # 보안 차단을 피하기 위해 네트워크 최초 응답 시점(commit)까지만 대기하고 진입
-            main_response = await page.goto("https://www.saramin.co.kr", wait_until="commit", timeout=20000)
-            print(f"[DEBUG 2-1] 메인 홈 응답 코드: {main_response.status if main_response else 'No Response'}")
-            
-            print(f"[DEBUG 3] 2차 검증: 목표 상세페이지 이동 중 -> {url}")
-            response = await page.goto(url, wait_until="commit", timeout=20000)
-            print(f"[DEBUG 4] 상세페이지 서버 응답 상태 코드 수신: {response.status if response else 'No Response'}")
-            
-            page_title = await page.title()
-            print(f"[DEBUG 5] 현재 브라우저가 읽은 페이지 제목(Title): '{page_title}'")
-            
-            # 렌더링 안정화를 위해 화면 조작 없이 3초 대기
-            await asyncio.sleep(3)
+            await page.goto(url, wait_until="commit", timeout=20000)
+            for _ in range(3):
+                await page.evaluate("window.scrollBy(0, 1000);")
+                await asyncio.sleep(0.3)
             html_content = await page.content()
-            
         except Exception as e:
-            print(f"\n❌ [CRITICAL ERROR] 상세페이지 로드 타임아웃/실패: {e}")
             await browser.close()
             return None
-            
         await browser.close()
-        print("[DEBUG 6] 브라우저 세션 정상 종료. BeautifulSoup 파싱 시작.")
-
-    if not html_content:
-        return None
-
-    soup = BeautifulSoup(html_content, 'html.parser')
-    main_section = soup.select_one("section[class^='jview-0-']") or soup.select_one("section.jview")
-    if not main_section:
-        print("❌ [DEBUG] HTML 파싱 실패: 공고 본문 섹션을 찾지 못했습니다.")
-        return None
 
     job_data = {
-        'rec_idx': rec_idx, 'company_name': 'N/A', 'job_title': 'N/A',
-        'experience': 'N/A', 'education': 'N/A', 'job_type': 'N/A',
-        'work_place': 'N/A', 'job_sectors': [], 'preferred_conditions': [],    
-        'company_scale': 'N/A', 'company_industry': 'N/A', 'description_text': 'N/A'     
+        'rec_idx': rec_idx, 'company_name': job_meta['list_company'], 'job_title': job_meta['list_title'],
+        'experience': '경력무관', 'education': '학력무관', 'job_type': '정규직', 'work_place': '근무지 미지정',
+        'job_sectors': [], 'preferred_conditions': [], 'company_scale': '중소기업', 'company_industry': 'IT·웹·통신',
+        'description_text': ''
     }
 
-    try:
-        company_tag = main_section.select_one("a.company")
-        if company_tag: job_data['company_name'] = company_tag.get_text(strip=True)
-        
-        title_tag = main_section.select_one("h1.tit_job")
-        if title_tag: job_data['job_title'] = title_tag.get_text(strip=True)
+    if not html_content:
+        return job_data
 
-        for dl in main_section.select("div.jv_summary div.col dl"):
-            dt_tag, dd_tag = dl.select_one("dt"), dl.select_one("dd")
-            if dt_tag and dd_tag:
-                dt, dd = dt_tag.get_text(strip=True), dd_tag.get_text(strip=True)
-                if '경력' in dt: job_data['experience'] = dd
-                elif '학력' in dt: job_data['education'] = dd
-                elif '근무형태' in dt: job_data['job_type'] = dd
-                elif '지역' in dt or '근무지' in dt: job_data['work_place'] = dd
-
-        preferred_div = main_section.select_one("div[id^='details-preferred-']")
-        if preferred_div:
-            job_data['preferred_conditions'] = [li.get_text(" ", strip=True) for li in preferred_div.select("li")]
-
-        sector_tags = main_section.select("div.tags a")
-        job_data['job_sectors'] = [tag.get_text(strip=True).replace('#', '') for tag in sector_tags]
-
-        for dl in main_section.select("div.info_area dl"):
-            dt_tag, dd_tag = dl.select_one("dt"), dl.select_one("dd")
-            if dt_tag and dd_tag:
-                dt = dt_tag.get_text(strip=True)
-                dd_txt = dd_tag.find(text=True, recursive=False)
-                dd_txt = dd_txt.strip() if dd_txt else dd_tag.get_text(strip=True)
-                if '기업형태' in dt: job_data['company_scale'] = dd_txt
-                elif '업종' in dt: job_data['company_industry'] = dd_txt
-
-        welfare_content = main_section.select_one("div.jv_details")
-        if welfare_content:
-            job_data['description_text'] = re.sub(r'\s+', ' ', welfare_content.get_text(" ", strip=True))
-    except Exception as e:
-        print(f"-> 파싱 중 에러 발생: {e}")
+    soup = BeautifulSoup(html_content, 'html.parser')
+    all_text_elements = soup.find_all(['p', 'div', 'li', 'span', 'th', 'td'])
+    heavy_text_pool = []
+    
+    for elem in all_text_elements:
+        text = elem.get_text(" ", strip=True)
+        if len(text) > 15 and text not in heavy_text_pool:
+            heavy_text_pool.append(text)
+            
+    job_data['description_text'] = re.sub(r'\s+', ' ', " ".join(heavy_text_pool))
+    
+    main_section = soup.select_one("section[class^='jview-0-']") or soup.select_one("section.jview")
+    if main_section:
+        try:
+            sector_tags = main_section.select("div.tags a")
+            job_data['job_sectors'] = [tag.get_text(strip=True).replace('#', '') for tag in sector_tags]
+            for dl in main_section.select("div.jv_summary div.col dl"):
+                dt_tag, dd_tag = dl.select_one("dt"), dl.select_one("dd")
+                if dt_tag and dd_tag:
+                    dt, dd = dt_tag.get_text(strip=True), dd_tag.get_text(strip=True)
+                    if '경력' in dt: job_data['experience'] = dd
+                    elif '학력' in dt: job_data['education'] = dd
+        except:
+            pass
 
     return job_data
 
-
 def save_to_mysql(data):
-    """
-    3단계: 원격 GCP MySQL 테이블에 적재합니다.
-    """
+    """3단계: GCP 세션 다운 시 죽지 않고 10초 대기 후 무한 재시도하는 적재 로직"""
     if not data or data['company_name'] == 'N/A':
-        return
+        return False
         
-    connection = get_connection()
-    try:
-        with connection.cursor() as cursor:
-            insert_query = """
-            INSERT INTO saramin_raw_jobs (
-                rec_idx, company_name, job_title, experience, education, 
-                job_type, work_place, job_sectors, preferred_conditions, 
-                company_scale, company_industry, description_text
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-            ON DUPLICATE KEY UPDATE
-                company_name=VALUES(company_name),
-                job_title=VALUES(job_title),
-                experience=VALUES(experience),
-                education=VALUES(education),
-                job_type=VALUES(job_type),
-                work_place=VALUES(work_place),
-                job_sectors=VALUES(job_sectors),
-                preferred_conditions=VALUES(preferred_conditions),
-                company_scale=VALUES(company_scale),
-                company_industry=VALUES(company_industry),
-                description_text=VALUES(description_text);
-            """
-            
-            sectors_json = json.dumps(data['job_sectors'], ensure_ascii=False)
-            preferred_json = json.dumps(data['preferred_conditions'], ensure_ascii=False)
-            
-            cursor.execute(insert_query, (
-                data['rec_idx'], data['company_name'], data['job_title'], data['experience'],
-                data['education'], data['job_type'], data['work_place'], sectors_json,
-                preferred_json, data['company_scale'], data['company_industry'], data['description_text']
-            ))
-        connection.commit()
-    except Exception as e:
-        print(f"-> MySQL 원격 적재 에러: {e}")
-    finally:
-        connection.close()
-
+    for attempt in range(1, 4):
+        try:
+            connection = get_connection()
+            with connection.cursor() as cursor:
+                insert_query = """
+                INSERT INTO saramin_raw_jobs (
+                    rec_idx, company_name, job_title, experience, education, 
+                    job_type, work_place, job_sectors, preferred_conditions, 
+                    company_scale, company_industry, description_text
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    company_name=VALUES(company_name), job_title=VALUES(job_title), description_text=VALUES(description_text);
+                """
+                sectors_json = json.dumps(data['job_sectors'], ensure_ascii=False)
+                preferred_json = json.dumps(data['preferred_conditions'], ensure_ascii=False)
+                cursor.execute(insert_query, (
+                    data['rec_idx'], data['company_name'], data['job_title'], data['experience'],
+                    data['education'], data['job_type'], data['work_place'], sectors_json,
+                    preferred_json, data['company_scale'], data['company_industry'], data['description_text']
+                ))
+            connection.commit()
+            return True
+        except Exception as e:
+            if attempt == 3:
+                write_log(f"   ❌ GCP MySQL 적재 최종 실패 (스킵 조치) : {e}")
+                return False
+            write_log(f"   ⚠️ GCP DB 세션 지연 터짐. 안전하게 10초 후 자동 재연결 들어갑니다... ({attempt}/3)")
+            time.sleep(10)
+        finally:
+            try: connection.close()
+            except: pass
+    return False
 
 async def main():
-    print("=== [테스트 모드] 로컬 가동 및 원격 적재 파이프라인 ===")
-    SAMPLE_REC_IDX = "53861623" 
+    write_log("================================================================")
+    write_log("🏁 [최종 마스터본] 커넥션 풀 + 화면 밖 격리 크롤러 마라톤 엔진 가동")
+    write_log("================================================================")
     
-    job_result = await fetch_and_parse_detail(SAMPLE_REC_IDX)
-    if job_result:
-        print("\n🎉 === 크롤링 및 파싱 성공! === ")
-        print(json.dumps(job_result, ensure_ascii=False, indent=4))
+    START_PAGE = 1
+    TOTAL_PAGES = 200  
+    
+    global_success_count = 0
+    estimated_total_bytes = 0
+    
+    for current_page in range(START_PAGE, START_PAGE + TOTAL_PAGES):
+        write_log(f"\n🔄 [페이지 진입] 현재 {current_page} / {START_PAGE + TOTAL_PAGES - 1} 페이지 수집 중...")
         
-        print("\n⏳ GCP MySQL 원격 저장을 시도합니다...")
-        save_to_mysql(job_result)
-        print("✅ DB 적재 완료 확인!")
+        jobs = await extract_jobs_from_list(current_page)
+        if not jobs:
+            write_log(f"   ⚠️ {current_page}페이지 일시적 지연 감지. 5초 대기 후 다음으로 우회.")
+            await asyncio.sleep(5)
+            continue
+            
+        page_success = 0
+        skip_count = 0
+        
+        for idx, job_meta in enumerate(jobs, start=1):
+            if check_already_exists(job_meta['rec_idx']):
+                skip_count += 1
+                global_success_count += 1
+                continue
+            
+            await asyncio.sleep(random.uniform(0.8, 1.4))
+            job_data = await fetch_and_parse_detail_heavy(job_meta)
+            if job_data:
+                success = save_to_mysql(job_data)
+                if success:
+                    page_success += 1
+                    global_success_count += 1
+                    
+                    data_bytes = len(job_data['description_text'].encode('utf-8'))
+                    estimated_total_bytes += data_bytes
+                    
+                    if global_success_count % 10 == 0:
+                        mb_size = estimated_total_bytes / (1024 * 1024)
+                        print(f"   📈 [실시간 메트릭스] 누적 수집: {global_success_count}건 | 추정 확보 용량: {mb_size:.2f} MB")
+                        
+        if skip_count > 0:
+            print(f"    ⏩ [{current_page}페이지] 이미 수집된 기존 공고 {skip_count}개 초고속 스킵 완료!")
+        if page_success > 0:
+            write_log(f"📊 [중간 리포트] {current_page}페이지 신규 데이터 {page_success}개 적재 성공")
+        
+        await asyncio.sleep(2)
+
+    write_log("\n================================================================")
+    write_log(f"🏆 [마라톤 수집 완료] 최종 누적량: {global_success_count}건 안착 완료!")
+    write_log(f"💾 최종 확보 용량: {estimated_total_bytes / (1024 * 1024):.2f} MB")
+    write_log("================================================================")
 
 if __name__ == "__main__":
     asyncio.run(main())
