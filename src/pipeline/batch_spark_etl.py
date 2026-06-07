@@ -1,120 +1,101 @@
+import sys
 import os
-import json
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf, from_json
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
-import google.generativeai as genai
+from pyspark.sql.functions import col, udf, lower, regexp_replace, split, array_contains, when, lit
+from pyspark.sql.types import ArrayType, StringType, BooleanType
 
-# 1. 독립형 로컬 스파크 세션 시작 (MySQL 커넥터 장착)
-spark = SparkSession.builder \
-    .appName("SaraminGeminiLLMAndSparkETL") \
-    .master("local[*]") \
-    .config("spark.jars.packages", "com.mysql:mysql-connector-j:8.0.33") \
-    .getOrCreate()
+def create_spark_session():
+    return SparkSession.builder \
+        .appName("Jumpit-Batch-ETL") \
+        .master("local[*]") \
+        .config("spark.sql.warehouse.dir", "/user/hive/warehouse") \
+        .config("spark.hadoop.fs.defaultFS", "hdfs://localhost:9000") \
+        .config("spark.hadoop.fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .config("spark.driver.memory", "512m") \
+        .config("spark.executor-memory", "512m") \
+        .enableHiveSupport() \
+        .getOrCreate()
 
-print("\n🚀 [데이터 처리 단계] 스파크 엔진 및 Gemini 1.5 Flash UDF 파이프라인 시동...")
+def clean_and_build_array(tech_string):
+    if not tech_string: return []
+    cleaned = str(tech_string).replace("[", "").replace("]", "").replace("'", "").replace('"', "")
+    return [t.strip().lower() for t in cleaned.split(",") if t.strip()]
 
-# 2. 형이 제공한 인프라 설정 정보 (GCP MySQL & Gemini)
-DB_HOST = "34.64.49.102"
-DB_PORT = "3306"
-DB_USER = "root"
-DB_PASSWORD = "ZSjIYVS$x0a1ZP?i"
-DB_NAME = "ai-employment"
-GEMINI_KEY = "AIzaSyAdNNJrPrCRnuXqVEXFKfLuxzaXeIbbgQw"
+def check_ai_skill(tech_list):
+    if not tech_list: return False
+    ai_keywords = ['ai/인공지능', '머신러닝', '딥러닝', 'ai', 'artificial intelligence', 'deep learning', 'machine learning', 'nlp', 'vision', 'llm', 'generative ai', 'pytorch', 'tensorflow', 'scikit-learn', 'keras', 'opencv', 'huggingface', 'langchain', 'data analysis']
+    return any(kw in tech_list for kw in ai_keywords)
 
-# 3. GCP MySQL로부터 Raw 데이터 수집 및 로드 (Playwright 수집본 백업 대체)
-try:
-    raw_df = spark.read \
-        .format("jdbc") \
-        .option("url", f"jdbc:mysql://{DB_HOST}:{DB_PORT}/{DB_NAME}") \
-        .option("dbtable", "saramin_raw_jobs") \
-        .option("user", DB_USER) \
-        .option("password", DB_PASSWORD) \
-        .option("driver", "com.mysql.cj.jdbc.Driver") \
-        .load()
-    print("💾 GCP MySQL로부터 채용 공고 비정형 데이터 로딩 성공!")
-except Exception as e:
-    print(f"❌ DB 로드 실패: {e}")
-    spark.stop()
-    exit(1)
+def check_traditional_skill(tech_list):
+    if not tech_list: return False
+    trad_keywords = ['r', 'python', 'java', 'javascript', 'typescript', 'c++', 'c#', 'c', 'go', 'kotlin', 'swift', 'php', 'html', 'css', 'spring', 'spring boot', 'react', 'node.js', 'vue.js', 'next.js', 'express', 'django', 'fastapi', 'flask', 'wpf', 'mysql', 'postgresql', 'oracle', 'mariadb', 'mongodb', 'redis', 'aws', 'docker', 'kubernetes', 'linux', 'git', 'github']
+    return any(kw in tech_list for kw in trad_keywords)
 
-# ======================== [4번 블록 긴급 패치 버전] ========================
-def analyze_job_text_with_gemini(description_text):
-    if not description_text or len(description_text.strip()) < 10:
-        return json.dumps({"experience_type": "미지정", "education": "미지정", "tech_stack": "", "ai_required": "N"})
+def check_experience_attr(q, p):
+    text = (str(q) + " " + str(p)).lower()
+    keywords = ['실무 경험', '현장 개발', '운영 경험', '구축 프로젝트', '상용 서비스', '시스템 통합', '유경험자', '개발 경험', '구현 경험', '설계 경험']
+    return any(kw in text for kw in keywords)
+
+def check_collaboration_attr(q, p):
+    text = (str(q) + " " + str(p)).lower()
+    keywords = ['의사소통', '커뮤니케이션', '원활한', '소통과 협업', '팀워크', '협업 능력', '원만한']
+    return any(kw in text for kw in keywords)
+
+def check_ai_relation_attr(q, p):
+    text = (str(q) + " " + str(p)).lower()
+    keywords = ['ai', '인공지능', '머신러닝', '딥러닝', '알고리즘 개발', '모델 개발', 'ai 추론', '추론 모델', 'ai 도구', 'ai를 활용', '업무 효율']
+    return any(kw in text for kw in keywords)
+
+def run_etl():
+    spark = create_spark_session()
+    clean_array_udf = udf(clean_and_build_array, ArrayType(StringType()))
+    ai_skill_udf = udf(check_ai_skill, BooleanType())
+    trad_skill_udf = udf(check_traditional_skill, BooleanType())
     
-    try:
-        # 워커 노드 내부 환경 설정
-        genai.configure(api_key=GEMINI_KEY)
-        
-        # ⚠️ 기존 genai.Model ──► genai.GenerativeModel 인터페이스로 정정!
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-        
-        prompt = f"""
-        당신은 IT 전문 채용 분석가입니다. 아래의 채용 공고문 텍스트를 분석하여 지정된 JSON 형식으로만 응답하세요. 
-        텍스트 외의 다른 설명이나 마크다운(```json)을 절대 포함하지 마십시오. 반드시 순수 JSON 스트링만 반환해야 합니다.
+    exp_udf = udf(check_experience_attr, BooleanType())
+    coll_udf = udf(check_collaboration_attr, BooleanType())
+    ai_rel_udf = udf(check_ai_relation_attr, BooleanType())
 
-        [분석 기준]
-        1. experience_type: '신입', '경력', '경력무관' 중 하나로 분류
-        2. education: '고졸', '초대졸', '대졸(4년제)', '석박사', '학력무관' 중 하나로 분류
-        3. tech_stack: 공고문에서 요구하는 기술 스택 키워드들을 쉼표(,)로 구분한 문자열 (예: 'Python, FastAPI, MySQL')
-        4. ai_required: AI 모델 활용, LLM, 딥러닝, 머신러닝 스킬 요구 여부 ('Y' 또는 'N')
+    print("\n===== 1. HDFS로부터 Raw 데이터 로드 =====")
+    input_path = "hdfs://localhost:9000/user/data/raw/jumpit_raw.json"
+    raw_df = spark.read.option("multiline", "true").json(input_path)
 
-        [JSON 출력 포맷 예시]
-        {{"experience_type": "경력", "education": "대졸(4년제)", "tech_stack": "Java, Spring, MySQL", "ai_required": "N"}}
-
-        [분석할 채용 공고문]
-        {description_text}
-        """
-        
-        response = model.generate_content(prompt)
-        result_text = response.text.replace("```json", "").replace("```", "").strip()
-        return result_text
-    except Exception as e:
-        # 디버깅 편의를 위해 에러 메시지 역추적용 텍스트 반환 유지
-        return json.dumps({"experience_type": "에러", "education": "에러", "tech_stack": str(e), "ai_required": "N"})
-        
-# 5. PySpark UDF(User Defined Function) 등록 ⭐️
-gemini_udf = udf(analyze_job_text_with_gemini, StringType())
-
-print("\n🤖 [LLM 전처리] Gemini 1.5 Flash API 호출 및 비정형 데이터 파싱 시작 (시간이 약간 소요될 수 있어 형!)...")
-
-# 실습 가속화를 위해 상위 5개 데이터 샘플링해서 LLM 파싱 테스트 진행
-sample_df = raw_df.limit(5)
-processed_json_df = sample_df.withColumn("gemini_json", gemini_udf(col("description_text")))
-
-# 6. JSON 파싱을 위한 스파크 스키마 정의
-json_schema = StructType([
-    StructField("experience_type", StringType(), True),
-    StructField("education", StringType(), True),
-    StructField("tech_stack", StringType(), True),
-    StructField("ai_required", StringType(), True)
-])
-
-# 7. JSON 컬럼을 스파크 DataFrame 정형 컬럼들로 변환
-final_structured_df = processed_json_df.withColumn("parsed_data", from_json(col("gemini_json"), json_schema)) \
-    .select(
-        col("rec_idx"),
+    print("\n===== 2. 데이터 정제 및 정형화 =====")
+    clean_pattern = r"[\n•\-\t\r]"
+    
+    processed_df = raw_df.select(
+        col("job_id").cast("string"),
+        col("title"),
         col("company_name"),
-        col("job_title"),
-        col("parsed_data.experience_type").alias("experience_type"),
-        col("parsed_data.education").alias("education"),
-        col("parsed_data.tech_stack").alias("tech_stack"),
-        col("parsed_data.ai_required").alias("ai_required"),
-        col("created_at")
+        when(col("education").isNull(), "학력무관").otherwise(col("education")).alias("education"),
+        when(col("career").isNull(), "경력무관").otherwise(col("career")).alias("career"),
+        regexp_replace(col("main_task"), clean_pattern, " ").alias("main_task"),
+        regexp_replace(col("qualification"), clean_pattern, " ").alias("qualification"),
+        regexp_replace(col("preferred_text"), clean_pattern, " ").alias("preferred_text"),
+        clean_array_udf(col("tech_stacks")).alias("tech_stacks_array")
     )
 
-print("\n✨ Gemini LLM 파싱 완료! 정형화된 데이터프레임 구조:")
-final_structured_df.show(5, truncate=False)
+    print("\n===== 3. 핵심 도메인 분석용 파생 변수 생성 =====")
+    final_df = processed_df \
+        .withColumn("has_ai_skill", ai_skill_udf(col("tech_stacks_array"))) \
+        .withColumn("has_trad_skill", trad_skill_udf(col("tech_stacks_array"))) \
+        .withColumn("has_experience_required", exp_udf(col("qualification"), col("preferred_text"))) \
+        .withColumn("has_collaboration_required", coll_udf(col("qualification"), col("preferred_text"))) \
+        .withColumn("has_ai_relation_required", ai_rel_udf(col("qualification"), col("preferred_text")))
 
-# 8. [최종 저장] 정제된 분석 마트 데이터를 Parquet 포맷으로 가뿐하게 분산 저장
-output_path = "data/2_processed/saramin_refined_parquet"
-print(f"\n💾 기획서 요구사항에 맞춰 Parquet 포맷으로 HDFS(로컬 대치) 적재 진행 ──► {output_path}")
+    print("\n===== 4. 정제된 데이터를 HDFS에 Parquet 포맷으로 분산 저장 =====")
+    output_path = "hdfs://localhost:9000/user/data/processed/jumpit_processed"
+    
+    final_df.write \
+        .mode("overwrite") \
+        .partitionBy("career", "education") \
+        .parquet(output_path)
 
-final_structured_df.write \
-    .mode("overwrite") \
-    .format("parquet") \
-    .save(output_path)
+    print(f"Parquet 분산 저장 완료: {output_path}")
+    
+    final_df.show(5, truncate=True)
+    spark.stop()
 
-print("🎉 [대성공] 2단계 데이터 처리(LLM UDF 전처리 및 Parquet 저장) 마스터 완료!")
-spark.stop()
+if __name__ == "__main__":
+    run_etl()

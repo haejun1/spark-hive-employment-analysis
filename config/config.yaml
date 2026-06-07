@@ -1,0 +1,27 @@
+# 개발 환경 설정
+development:
+  # 데이터베이스 접속 정보
+  mysql:
+    host: "34.64.49.102"
+    port: 3306
+    user: "root"
+    password: "ZSjIYVS$x0a1ZP?i"
+    database: "ai-employment"
+    table_name: "jumpit_jobs"
+
+  # 점핏 API
+  jumpit:
+    base_url: "https://jumpit-api.saramin.co.kr/api"
+    endpoint: "/positions"
+
+  # kafka 설정
+  kafka:
+    bootstrap_servers: "localhost:9092"
+    topic: "jumpit-realtime-jobs" 
+    group_id: "jumpit-streaming-group"
+
+  # spark 설정
+  spark:
+    master: "local[*]"
+    shuffle_partitions: "2"
+    parquet_path: "data/processed/jumpit_refined_parquet"

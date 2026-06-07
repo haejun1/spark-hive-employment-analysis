@@ -1,0 +1,13 @@
+----------------------------------------------------------------
+Sun Jun 07 13:25:55 UTC 2026:
+Booting Derby version The Apache Software Foundation - Apache Derby - 10.14.2.0 - (1828579): instance a816c00e-019e-a242-ecb8-00000aa80de8 
+on database directory /home/bhc0224/AI-EMPLOYMENT-ANALYSIS/metastore_db with class loader jdk.internal.loader.ClassLoaders$AppClassLoader@5ffd2b27 
+Loaded from file:/home/bhc0224/AI-EMPLOYMENT-ANALYSIS/venv/lib/python3.8/site-packages/pyspark/jars/derby-10.14.2.0.jar
+java.vendor=Ubuntu
+java.runtime.version=11.0.31+11-post-1ubuntu1-20.04.2-Ubuntu
+user.dir=/home/bhc0224/AI-EMPLOYMENT-ANALYSIS
+os.name=Linux
+os.arch=amd64
+os.version=5.15.0-1109-gcp
+derby.system.home=null
+Database Class Loader started - derby.database.classpath=''
