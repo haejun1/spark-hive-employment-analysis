@@ -9,3 +9,5 @@ data/
 logs/
 *.csv
 *.xlsx
+
+.env
